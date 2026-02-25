@@ -279,8 +279,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     var geoNicknames: [String: String] = [:] // pubkeyHex(lowercased) -> nickname
     // Show Tor status once per app launch
     var torStatusAnnounced = false
-    private var torProgressCancellable: AnyCancellable?
-    private var lastTorProgressAnnounced = -1
     // Track whether a Tor restart is pending so we only announce
     // "tor restarted" after an actual restart, not the first launch.
     var torRestartPending: Bool = false
@@ -323,8 +321,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     )
     // Channel activity tracking for background nudges
     var lastPublicActivityAt: [String: Date] = [:]   // channelKey -> last activity time
-    private var lastPublicActivityNotifyAt: [String: Date] = [:]
-    private let channelInactivityThreshold: TimeInterval = TransportConfig.uiChannelInactivityThresholdSeconds
     // Geohash participant tracker
     let participantTracker = GeohashParticipantTracker(activityCutoff: -TransportConfig.uiRecentCutoffFiveMinutesSeconds)
     // Participants who indicated they teleported (by tag in their events)
@@ -448,7 +444,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         self.deduplicationService = MessageDeduplicationService()
 
         // Wire up dependencies
-        self.commandProcessor.chatViewModel = self
+        self.commandProcessor.contextProvider = self
         self.participantTracker.configure(context: self)
         
         // Subscribe to privateChatManager changes to trigger UI updates
@@ -503,8 +499,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             addGeohashOnlySystemMessage(
                 String(localized: "system.tor.starting", comment: "System message when Tor is starting")
             )
-            // Suppress incremental Tor progress messages
-            torProgressCancellable = nil
         } else if !TorManager.shared.torEnforced && !torStatusAnnounced {
             torStatusAnnounced = true
             addGeohashOnlySystemMessage(
@@ -631,8 +625,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             object: nil
         )
         
-        // Listen for delivery acknowledgments
-                
         // When app becomes active, send read receipts for visible messages
         #if os(macOS)
         NotificationCenter.default.addObserver(
@@ -1468,56 +1460,6 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         selectedPrivateChatFingerprint = nil
     }
     
-    // MARK: - Nostr Message Handling
-    
-    @MainActor
-    @objc private func handleNostrMessage(_ notification: Notification) {
-        guard let message = notification.userInfo?["message"] as? BitchatMessage else { return }
-        
-        // Store the Nostr pubkey if provided (for messages from unknown senders)
-        if let nostrPubkey = notification.userInfo?["nostrPubkey"] as? String,
-           let senderPeerID = message.senderPeerID {
-            // Store mapping for read receipts
-            nostrKeyMapping[senderPeerID] = nostrPubkey
-        }
-        
-        // Process the Nostr message through the same flow as Bluetooth messages
-        didReceiveMessage(message)
-    }
-    
-    @objc private func handleDeliveryAcknowledgment(_ notification: Notification) {
-        guard let messageId = notification.userInfo?["messageId"] as? String else { return }
-        
-        
-        
-        // Update the delivery status for the message
-        if let index = messages.firstIndex(where: { $0.id == messageId }) {
-            // Update delivery status to delivered
-            messages[index].deliveryStatus = DeliveryStatus.delivered(to: "nostr", at: Date())
-            
-            // Schedule UI update for delivery status
-            // UI will update automatically
-        }
-        
-        // Also update in private chats if it's a private message
-        for (peerID, chatMessages) in privateChats {
-            if let index = chatMessages.firstIndex(where: { $0.id == messageId }) {
-                privateChats[peerID]?[index].deliveryStatus = DeliveryStatus.delivered(to: "nostr", at: Date())
-                // UI will update automatically
-                break
-            }
-        }
-    }
-    
-    @objc private func handleNostrReadReceipt(_ notification: Notification) {
-        guard let receipt = notification.userInfo?["receipt"] as? ReadReceipt else { return }
-        
-        SecureLogger.info("📖 Handling read receipt for message \(receipt.originalMessageID) from Nostr", category: .session)
-        
-        // Process the read receipt through the same flow as Bluetooth read receipts
-        didReceiveReadReceipt(receipt)
-    }
-    
     @MainActor
     @objc private func handlePeerStatusUpdate(_ notification: Notification) {
         // Update private chat peer if needed when peer status changes
@@ -2055,13 +1997,42 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             } catch {
                 SecureLogger.error("Failed to clear media files during panic: \(error)", category: .session)
             }
+
+            // BCH-01-013: Clear iOS app switcher snapshots
+            // These are stored in Library/Caches/Snapshots/<bundle_id>/
+            #if os(iOS)
+            Self.clearAppSwitcherSnapshots()
+            #endif
         }
 
         // Force immediate UI update for panic mode
         // UI updates immediately - no flushing needed
 
     }
-    
+
+    /// BCH-01-013: Clear iOS app switcher snapshots during panic mode
+    /// iOS stores preview screenshots in Library/Caches/Snapshots/<bundle_id>/
+    /// These could reveal sensitive information visible in the app at the time
+    #if os(iOS)
+    private nonisolated static func clearAppSwitcherSnapshots() {
+        do {
+            let cacheDir = try FileManager.default.url(for: .cachesDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
+            let snapshotsDir = cacheDir.appendingPathComponent("Snapshots", isDirectory: true)
+
+            // Clear all snapshots (iOS stores them in subdirectories by bundle ID and scene)
+            if FileManager.default.fileExists(atPath: snapshotsDir.path) {
+                let contents = try FileManager.default.contentsOfDirectory(at: snapshotsDir, includingPropertiesForKeys: nil)
+                for item in contents {
+                    try FileManager.default.removeItem(at: item)
+                }
+                SecureLogger.info("🗑️ Cleared app switcher snapshots during panic clear", category: .session)
+            }
+        } catch {
+            SecureLogger.error("Failed to clear app switcher snapshots: \(error)", category: .session)
+        }
+    }
+    #endif
+
     // MARK: - Autocomplete
     
     func updateAutocomplete(for text: String, cursorPosition: Int) {
@@ -3046,46 +3017,91 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         }
     }
 
+    /// Find message index trying both short (16-hex) and long (64-hex) peer ID formats.
+    /// Returns the peer ID where the message was found and its index, or nil if not found.
+    private func findMessageIndex(messageID: String, peerID: PeerID) -> (peerID: PeerID, index: Int)? {
+        // Try direct lookup first
+        if let messages = privateChats[peerID],
+           let idx = messages.firstIndex(where: { $0.id == messageID }) {
+            return (peerID, idx)
+        }
+
+        // Try with full noise key if peerID is short (16 hex chars)
+        if peerID.bare.count == 16,
+           let peer = unifiedPeerService.getPeer(by: peerID),
+           !peer.noisePublicKey.isEmpty {
+            let longID = PeerID(hexData: peer.noisePublicKey)
+            if let messages = privateChats[longID],
+               let idx = messages.firstIndex(where: { $0.id == messageID }) {
+                return (longID, idx)
+            }
+        }
+
+        // Try with short form if peerID is long (64 hex = noise key)
+        if peerID.bare.count == 64 {
+            let shortID = peerID.toShort()
+            if let messages = privateChats[shortID],
+               let idx = messages.firstIndex(where: { $0.id == messageID }) {
+                return (shortID, idx)
+            }
+        }
+
+        return nil
+    }
+
     // Low-level BLE events
     func didReceiveNoisePayload(from peerID: PeerID, type: NoisePayloadType, payload: Data, timestamp: Date) {
         Task { @MainActor in
             switch type {
             case .privateMessage:
                 guard let pm = PrivateMessagePacket.decode(from: payload) else { return }
+
+                // BCH-01-012: Check blocking before processing private message to prevent notification bypass
+                if isPeerBlocked(peerID) {
+                    SecureLogger.debug("🚫 Ignoring Noise payload from blocked peer: \(peerID)", category: .security)
+                    return
+                }
+
                 let senderName = unifiedPeerService.getPeer(by: peerID)?.nickname ?? "Unknown"
-            let pmMentions = parseMentions(from: pm.content)
-            let msg = BitchatMessage(
-                id: pm.messageID,
-                sender: senderName,
-                content: pm.content,
-                timestamp: timestamp,
-                isRelay: false,
-                originalSender: nil,
-                isPrivate: true,
-                recipientNickname: nickname,
-                senderPeerID: peerID,
-                mentions: pmMentions.isEmpty ? nil : pmMentions
-            )
+                let pmMentions = parseMentions(from: pm.content)
+                let msg = BitchatMessage(
+                    id: pm.messageID,
+                    sender: senderName,
+                    content: pm.content,
+                    timestamp: timestamp,
+                    isRelay: false,
+                    originalSender: nil,
+                    isPrivate: true,
+                    recipientNickname: nickname,
+                    senderPeerID: peerID,
+                    mentions: pmMentions.isEmpty ? nil : pmMentions
+                )
                 handlePrivateMessage(msg)
                 // Send delivery ACK back over BLE
                 meshService.sendDeliveryAck(for: pm.messageID, to: peerID)
 
             case .delivered:
                 guard let messageID = String(data: payload, encoding: .utf8) else { return }
-                if let name = unifiedPeerService.getPeer(by: peerID)?.nickname {
-                    if let messages = privateChats[peerID], let idx = messages.firstIndex(where: { $0.id == messageID }) {
-                        privateChats[peerID]?[idx].deliveryStatus = .delivered(to: name, at: Date())
-                        objectWillChange.send()
-                    }
-                }
+                guard let name = unifiedPeerService.getPeer(by: peerID)?.nickname,
+                      let (foundPeerID, idx) = findMessageIndex(messageID: messageID, peerID: peerID) else { return }
+
+                // Don't downgrade from .read to .delivered
+                if case .read = privateChats[foundPeerID]?[idx].deliveryStatus { return }
+
+                privateChats[foundPeerID]?[idx].deliveryStatus = .delivered(to: name, at: Date())
+                objectWillChange.send()
 
             case .readReceipt:
                 guard let messageID = String(data: payload, encoding: .utf8) else { return }
-                if let name = unifiedPeerService.getPeer(by: peerID)?.nickname {
-                    if let messages = privateChats[peerID], let idx = messages.firstIndex(where: { $0.id == messageID }) {
-                        privateChats[peerID]?[idx].deliveryStatus = .read(by: name, at: Date())
-                        objectWillChange.send()
-                    }
+                guard let name = unifiedPeerService.getPeer(by: peerID)?.nickname,
+                      let (foundPeerID, idx) = findMessageIndex(messageID: messageID, peerID: peerID) else { return }
+
+                // Explicitly unwrap and re-assign to ensure the @Published setter is called
+                if let messages = privateChats[foundPeerID], idx < messages.count {
+                    messages[idx].deliveryStatus = .read(by: name, at: Date())
+                    privateChats[foundPeerID] = messages
+                    privateChatManager.objectWillChange.send()
+                    objectWillChange.send()
                 }
             case .verifyChallenge:
                 // Parse and respond
@@ -3332,18 +3348,25 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 self.scheduleNetworkEmptyTimer()
             } else {
                 self.invalidateNetworkEmptyTimer()
-                // Trim out peers we no longer observe before comparing for new arrivals
-                self.recentlySeenPeers.formIntersection(meshPeerSet)
+                // Don't trim recentlySeenPeers here - let timers handle cleanup.
+                // Trimming immediately causes peers to be treated as "new" when they
+                // briefly drop and reconnect, triggering notification floods.
                 let newPeers = meshPeerSet.subtracting(self.recentlySeenPeers)
-                
+
                 if !newPeers.isEmpty {
-                    self.lastNetworkNotificationTime = Date()
-                    self.recentlySeenPeers.formUnion(newPeers)
-                    NotificationService.shared.sendNetworkAvailableNotification(peerCount: meshPeers.count)
-                    SecureLogger.info(
-                        "👥 Sent bitchatters nearby notification for \(meshPeers.count) mesh peers (new: \(newPeers.count))",
-                        category: .session
-                    )
+                    // Rate limit: max one notification per 5 minutes
+                    let cooldown = TransportConfig.networkNotificationCooldownSeconds
+                    if Date().timeIntervalSince(self.lastNetworkNotificationTime) >= cooldown {
+                        // Only mark peers as seen when we actually notify about them
+                        // This ensures peers arriving during cooldown will be included in the next notification
+                        self.recentlySeenPeers.formUnion(newPeers)
+                        self.lastNetworkNotificationTime = Date()
+                        NotificationService.shared.sendNetworkAvailableNotification(peerCount: meshPeers.count)
+                        SecureLogger.info(
+                            "👥 Sent bitchatters nearby notification for \(meshPeers.count) mesh peers (new: \(newPeers.count))",
+                            category: .session
+                        )
+                    }
                     self.scheduleNetworkResetTimer()
                 }
             }

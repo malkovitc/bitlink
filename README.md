@@ -6,6 +6,12 @@ Decentralized P2P messenger with dual transport: Bluetooth mesh for offline and 
 
 BitLink creates a mesh network from nearby devices via Bluetooth. Messages hop between devices (up to 7 hops), so you can communicate even if you're not directly nearby. When internet is available — connects to global Nostr network.
 
+Based on [bitchat](https://github.com/permissionlesstech/bitchat) · [bitchat.free](http://bitchat.free) · 📲 [App Store](https://apps.apple.com/us/app/bitchat-mesh/id6748219622)
+
+## License
+
+This project is released into the public domain. See the [LICENSE](LICENSE) file for details.
+
 ## Features
 
 - **Bluetooth mesh** — works offline, messages relay through chain of devices
